@@ -4,11 +4,13 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"runtime"
 	"time"
 
 	"github.com/lucas-clemente/quic-go/http3"
+	"github.com/snowmerak/hhh/circuitbreaker"
 	"github.com/snowmerak/hhh/config"
 	"github.com/snowmerak/hhh/loadbalancer"
 	"github.com/snowmerak/hhh/ratelimiter"
@@ -49,19 +51,66 @@ func main() {
 
 	limiter := ratelimiter.New(cf.LimitPerMillisecond, time.Millisecond)
 	balancer := loadbalancer.New()
-	http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		counter := 0
-		for !limiter.TryTake() && counter < cf.MaxTryCount {
-			counter++
-			time.Sleep(time.Millisecond)
-			runtime.Gosched()
-		}
-		if counter >= cf.MaxTryCount {
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
+	breaker := circuitbreaker.New(balancer)
 
-		balancer.Get()
+	for _, target := range cf.ReverseProxyAddresses {
+		if err := balancer.Add(target); err != nil {
+			log.Println(err)
+			os.Exit(1)
+		}
+	}
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		for totalCounter := 0; totalCounter < 10; totalCounter++ {
+			counter := 0
+			for !limiter.TryTake() && counter < cf.MaxTryCount {
+				counter++
+				time.Sleep(time.Millisecond)
+				runtime.Gosched()
+			}
+			if counter >= cf.MaxTryCount {
+				w.WriteHeader(http.StatusTooManyRequests)
+				log.Println("Too many requests")
+				continue
+			}
+
+			name, server, err := balancer.Get()
+			if err != nil {
+				log.Println(err)
+				w.WriteHeader(http.StatusInternalServerError)
+				limiter.Restore(1)
+				continue
+			}
+
+			resp := loadbalancer.NewResponse()
+
+			server.ServeHTTP(resp, r)
+
+			if resp.StatusCode >= 500 {
+				if err := breaker.Add(name, server); err != nil {
+					log.Println(err)
+				}
+				if err := balancer.Sub(name); err != nil {
+					log.Println(err)
+				}
+				continue
+			}
+
+			if err := balancer.Restore(name); err != nil {
+				log.Println(err)
+			}
+			limiter.Restore(1)
+
+			for k, v := range resp.Headers {
+				w.Header().Del(k)
+				for _, vv := range v {
+					w.Header().Add(k, vv)
+				}
+			}
+			w.Write(resp.Body)
+			w.WriteHeader(resp.StatusCode)
+			break
+		}
 	})
 
 	termSig := signal.NewTerminate()
@@ -78,4 +127,8 @@ func main() {
 
 	log.Println("Waiting for termination signal")
 	<-termSig
+}
+
+func ProxyRequest(server *httputil.ReverseProxy, rw http.ResponseWriter, req *http.Request) {
+	server.ServeHTTP(rw, req)
 }
