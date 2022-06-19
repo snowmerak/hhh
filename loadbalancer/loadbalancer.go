@@ -2,7 +2,10 @@ package loadbalancer
 
 import (
 	"errors"
+	"fmt"
 	"math"
+	"net/http/httputil"
+	"net/url"
 
 	"github.com/snowmerak/hhh/system/lock"
 )
@@ -25,14 +28,19 @@ func ErrAlreadyExist() error {
 	return errAlreadyExist
 }
 
+type proxy struct {
+	server *httputil.ReverseProxy
+	count  int64
+}
+
 type LoadBalancer struct {
-	candidates map[string]int64
+	candidates map[string]*proxy
 	l          *lock.Lock
 }
 
 func New() *LoadBalancer {
 	return &LoadBalancer{
-		candidates: make(map[string]int64),
+		candidates: make(map[string]*proxy),
 		l:          new(lock.Lock),
 	}
 }
@@ -45,7 +53,27 @@ func (l *LoadBalancer) Add(target string) error {
 		return ErrAlreadyExist()
 	}
 
-	l.candidates[target] = 0
+	l.candidates[target] = &proxy{
+		count: 0,
+	}
+	url, err := url.Parse(target)
+	if err != nil {
+		return fmt.Errorf("LoadBalancer.Add: url.Parse: %s", err)
+	}
+	l.candidates[target].server = httputil.NewSingleHostReverseProxy(url)
+	return nil
+}
+
+func (l *LoadBalancer) Append(target string, server *httputil.ReverseProxy) error {
+	l.l.Lock()
+	defer l.l.Unlock()
+
+	if _, ok := l.candidates[target]; ok {
+		return ErrAlreadyExist()
+	}
+
+	l.candidates[target].count = 0
+	l.candidates[target].server = server
 	return nil
 }
 
@@ -61,25 +89,25 @@ func (l *LoadBalancer) Sub(target string) error {
 	return nil
 }
 
-func (l *LoadBalancer) Get() (string, error) {
+func (l *LoadBalancer) Get() (string, *httputil.ReverseProxy, error) {
 	l.l.Lock()
 	defer l.l.Unlock()
 
 	min := int64(math.MaxInt64)
 	target := ""
 	for k, v := range l.candidates {
-		if v < min {
+		if v.count < min {
 			target = k
-			min = v
+			min = v.count
 		}
 	}
 
 	if target == "" {
-		return "", ErrEmptyValue()
+		return "", nil, ErrEmptyValue()
 	}
 
-	l.candidates[target]++
-	return target, nil
+	l.candidates[target].count++
+	return target, l.candidates[target].server, nil
 }
 
 func (l *LoadBalancer) Restore(target string) error {
@@ -90,6 +118,6 @@ func (l *LoadBalancer) Restore(target string) error {
 		return ErrNotExist()
 	}
 
-	l.candidates[target]--
+	l.candidates[target].count--
 	return nil
 }
